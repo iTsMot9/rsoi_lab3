@@ -63,7 +63,8 @@ async def payment_create_fallback():
     raise HTTPException(status_code=503, detail="Payment Service unavailable")
 
 async def payment_read_fallback():
-    raise Exception("Payment Service unavailable")
+    return {}
+
 
 @app.get("/manage/health")
 def health():
@@ -94,13 +95,12 @@ async def get_rentals(username: str = Header(..., alias="X-User-Name")):
                 car_resp.raise_for_status()
                 car = car_resp.json()
 
-                payment = {}
-                try:
+                async def _get_payment():
                     payment_resp = await client.get(f"{PAYMENT_SERVICE}/api/v1/payment/{rental['paymentUid']}", timeout=3.0)
                     payment_resp.raise_for_status()
-                    payment = payment_resp.json()
-                except (httpx.RequestError, httpx.HTTPStatusError, Exception):
-                    payment = {}
+                    return payment_resp.json()
+
+                payment = await payment_cb.call(_get_payment, payment_read_fallback)
 
                 aggregated.append({
                     "rentalUid": rental["rentalUid"],
@@ -131,14 +131,17 @@ async def get_rental(rental_uid: str, username: str = Header(..., alias="X-User-
             car_resp.raise_for_status()
             car = car_resp.json()
 
-            payment = {}
-            try:
+            async def _get_payment():
                 payment_resp = await client.get(f"{PAYMENT_SERVICE}/api/v1/payment/{rental['paymentUid']}", timeout=3.0)
                 payment_resp.raise_for_status()
-                payment = payment_resp.json()
-            except (httpx.RequestError, httpx.HTTPStatusError, Exception):
-                payment = {}
+                return payment_resp.json()
 
+            payment = await payment_cb.call(_get_payment, payment_read_fallback)
+
+            # Если платежный сервис недоступен, возвращаем пустой объект
+            if payment == {}:
+                return JSONResponse(content={})
+            
             return JSONResponse(content={
                 "rentalUid": rental["rentalUid"],
                 "status": rental["status"],
@@ -183,13 +186,9 @@ async def create_rental(req: RentalRequest, username: str = Header(..., alias="X
             payment.raise_for_status()
             return payment.json()
 
-        try:
-            payment_data = await payment_cb.call(_create_payment, payment_create_fallback)
-        except HTTPException as e:
-            if e.detail == "Payment Service unavailable":
-                raise HTTPException(status_code=503, detail="Payment Service unavailable")
-            raise
-
+        # Вызываем платежный сервис через circuit breaker
+        payment_data = await payment_cb.call(_create_payment, payment_create_fallback)
+        
         payment_uid = payment_data["paymentUid"]
 
         rental = await client.post(
