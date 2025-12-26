@@ -3,6 +3,8 @@ uvicorn[standard]
 psycopg2-binary
 httpx
 pydantic
+requests
 python-dateutil
 pytest
 pytest-asyncio
+pybreaker

@@ -1,107 +1,144 @@
-from fastapi.responses import Response
-from fastapi import FastAPI, HTTPException, Header, Query
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Header, Query, Request
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 import httpx
 from datetime import datetime
-import time
+import uuid
+import logging
+import pybreaker
+from httpx import ConnectError, TimeoutException, NetworkError
+
+payment_circuit = pybreaker.CircuitBreaker(
+    fail_max=2,
+    reset_timeout=15000
+)
+
+rental_circuit = pybreaker.CircuitBreaker(
+    fail_max=2,
+    reset_timeout=15000
+)
+
+cars_circuit = pybreaker.CircuitBreaker(
+    fail_max=2,
+    reset_timeout=15000
+)
 
 app = FastAPI()
-
 CARS_SERVICE = "http://cars-service:8070"
 RENTAL_SERVICE = "http://rental-service:8060"
 PAYMENT_SERVICE = "http://payment-service:8050"
 
+saga_log = {}
 
-class CircuitBreaker:
-    def __init__(self, name: str, failure_threshold: int = 3, recovery_timeout: int = 30):
-        self.name = name
-        self.failure_threshold = failure_threshold
-        self.recovery_timeout = recovery_timeout
-        self.failure_count = 0
-        self.last_failure_time = None
-        self.state = "CLOSED"
+class RentalRequest(BaseModel):
+    carUid: str
+    dateFrom: str
+    dateTo: str
 
-    async def call(self, func, fallback_func):
-        if self.state == "OPEN":
-            if time.time() - self.last_failure_time > self.recovery_timeout:
-                self.state = "HALF_OPEN"
-            else:
-                return await fallback_func()
+@payment_circuit
+async def call_create_payment(client, price: int):
+    r = await client.post(f"{PAYMENT_SERVICE}/api/v1/payment", json={"price": price})
+    r.raise_for_status()
+    return r.json()
 
-        try:
-            result = await func()
-            self._on_success()
-            return result
-        except Exception:
-            self._on_failure()
-            return await fallback_func()
+@payment_circuit
+async def call_cancel_payment(client, payment_uid: str):
+    r = await client.delete(f"{PAYMENT_SERVICE}/api/v1/payment/{payment_uid}")
+    r.raise_for_status()
+    return r.json()
 
-    def _on_success(self):
-        self.failure_count = 0
-        self.state = "CLOSED"
+@rental_circuit
+async def call_get_rental(client, rental_uid: str, username: str):
+    r = await client.get(f"{RENTAL_SERVICE}/api/v1/rental/{rental_uid}", headers={"X-User-Name": username})
+    r.raise_for_status()
+    return r.json()
 
-    def _on_failure(self):
-        self.failure_count += 1
-        self.last_failure_time = time.time()
-        if self.failure_count >= self.failure_threshold:
-            self.state = "OPEN"
+@rental_circuit
+async def call_get_rentals(client, username: str):
+    r = await client.get(f"{RENTAL_SERVICE}/api/v1/rental", headers={"X-User-Name": username})
+    r.raise_for_status()
+    return r.json()
 
+@rental_circuit
+async def call_create_rental(client, data: dict, username: str):
+    r = await client.post(
+        f"{RENTAL_SERVICE}/api/v1/rental",
+        json=data,
+        headers={"X-User-Name": username}
+    )
+    r.raise_for_status()
+    return r.json()
 
-cars_cb = CircuitBreaker("cars", failure_threshold=3, recovery_timeout=30)
-rental_cb = CircuitBreaker("rental", failure_threshold=3, recovery_timeout=30)
-payment_cb = CircuitBreaker("payment", failure_threshold=3, recovery_timeout=30)
+@rental_circuit
+async def call_cancel_rental(client, rental_uid: str, username: str):
+    r = await client.delete(f"{RENTAL_SERVICE}/api/v1/rental/{rental_uid}", headers={"X-User-Name": username})
+    r.raise_for_status()
+    return r.json()
 
+@rental_circuit
+async def call_finish_rental(client, rental_uid: str, username: str):
+    r = await client.post(f"{RENTAL_SERVICE}/api/v1/rental/{rental_uid}/finish", headers={"X-User-Name": username})
+    r.raise_for_status()
+    return r.json()
 
-async def cars_fallback():
-    raise HTTPException(status_code=503, detail="Cars Service unavailable")
+@cars_circuit
+async def call_get_cars(client, page: int, size: int, showAll: bool):
+    params = {"page": page, "size": size, "showAll": str(showAll).lower()}
+    r = await client.get(f"{CARS_SERVICE}/api/v1/cars", params=params)
+    r.raise_for_status()
+    return r.json()
 
-async def rental_fallback():
-    raise HTTPException(status_code=503, detail="Rental Service unavailable")
+@cars_circuit
+async def call_get_car(client, car_uid: str):
+    r = await client.get(f"{CARS_SERVICE}/api/v1/cars/{car_uid}")
+    r.raise_for_status()
+    return r.json()
 
-async def payment_create_fallback():
-    raise HTTPException(status_code=503, detail="Payment Service unavailable")
+@cars_circuit
+async def call_reserve_car(client, car_uid: str):
+    r = await client.put(f"{CARS_SERVICE}/api/v1/cars/{car_uid}/reserve")
+    r.raise_for_status()
+    return r.json()
 
-async def payment_read_fallback():
-    return {}
-
+@cars_circuit
+async def call_release_car(client, car_uid: str):
+    r = await client.put(f"{CARS_SERVICE}/api/v1/cars/{car_uid}/release")
+    r.raise_for_status()
+    return r.json()
 
 @app.get("/manage/health")
 def health():
     return JSONResponse(content={"status": "OK"})
 
-
 @app.get("/api/v1/cars")
 async def get_cars(page: int = Query(1, ge=1), size: int = Query(10, ge=1), showAll: bool = Query(False)):
-    async def _call():
+    try:
         async with httpx.AsyncClient() as client:
-            params = {"page": page, "size": size, "showAll": str(showAll).lower()}
-            r = await client.get(f"{CARS_SERVICE}/api/v1/cars", params=params, timeout=3.0)
-            r.raise_for_status()
-            return r.json()
-    return await cars_cb.call(_call, cars_fallback)
-
+            cars = await call_get_cars(client, page, size, showAll)
+            return cars
+    except pybreaker.CircuitBreakerError:
+        return JSONResponse(status_code=503, content={"message": "Cars Service unavailable"})
+    except (ConnectError, TimeoutException, NetworkError):
+        return JSONResponse(status_code=503, content={"message": "Cars Service unavailable"})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"message": str(e)})
 
 @app.get("/api/v1/rental")
 async def get_rentals(username: str = Header(..., alias="X-User-Name")):
-    async def _call():
+    try:
         async with httpx.AsyncClient() as client:
-            r = await client.get(f"{RENTAL_SERVICE}/api/v1/rental", headers={"X-User-Name": username}, timeout=3.0)
-            r.raise_for_status()
-            rentals = r.json()
+            rentals = await call_get_rentals(client, username)
             aggregated = []
             for rental in rentals:
-                car_resp = await client.get(f"{CARS_SERVICE}/api/v1/cars/{rental['carUid']}", timeout=3.0)
-                car_resp.raise_for_status()
-                car = car_resp.json()
-
-                async def _get_payment():
-                    payment_resp = await client.get(f"{PAYMENT_SERVICE}/api/v1/payment/{rental['paymentUid']}", timeout=3.0)
-                    payment_resp.raise_for_status()
-                    return payment_resp.json()
-
-                payment = await payment_cb.call(_get_payment, payment_read_fallback)
-
+                car = await call_get_car(client, rental['carUid'])
+                payment = {"paymentUid": rental['paymentUid'], "status": "UNKNOWN", "price": 0}
+                try:
+                    p_resp = await client.get(f"{PAYMENT_SERVICE}/api/v1/payment/{rental['paymentUid']}")
+                    if p_resp.status_code == 200:
+                        payment = p_resp.json()
+                except:
+                    if rental.get("status") == "CANCELED":
+                        payment = {"paymentUid": rental['paymentUid'], "status": "CANCELED", "price": 0}
                 aggregated.append({
                     "rentalUid": rental["rentalUid"],
                     "status": rental["status"],
@@ -116,32 +153,28 @@ async def get_rentals(username: str = Header(..., alias="X-User-Name")):
                     "payment": payment
                 })
             return JSONResponse(content=aggregated)
-    return await rental_cb.call(_call, rental_fallback)
-
+    except pybreaker.CircuitBreakerError:
+        return JSONResponse(status_code=503, content={"message": "Rental Service unavailable"})
+    except (ConnectError, TimeoutException, NetworkError):
+        return JSONResponse(status_code=503, content={"message": "Rental Service unavailable"})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"message": str(e)})
 
 @app.get("/api/v1/rental/{rental_uid}")
 async def get_rental(rental_uid: str, username: str = Header(..., alias="X-User-Name")):
-    async def _call():
+    try:
         async with httpx.AsyncClient() as client:
-            r = await client.get(f"{RENTAL_SERVICE}/api/v1/rental/{rental_uid}", headers={"X-User-Name": username}, timeout=3.0)
-            r.raise_for_status()
-            rental = r.json()
-
-            car_resp = await client.get(f"{CARS_SERVICE}/api/v1/cars/{rental['carUid']}", timeout=3.0)
-            car_resp.raise_for_status()
-            car = car_resp.json()
-
-            async def _get_payment():
-                payment_resp = await client.get(f"{PAYMENT_SERVICE}/api/v1/payment/{rental['paymentUid']}", timeout=3.0)
-                payment_resp.raise_for_status()
-                return payment_resp.json()
-
-            payment = await payment_cb.call(_get_payment, payment_read_fallback)
-
-            # Если платежный сервис недоступен, возвращаем пустой объект
-            if payment == {}:
-                return JSONResponse(content={})
-            
+            rental = await call_get_rental(client, rental_uid, username)
+            car = await call_get_car(client, rental['carUid'])
+            payment = {"paymentUid": rental['paymentUid'], "status": "UNKNOWN", "price": 0}
+            try:
+                p_resp = await client.get(f"{PAYMENT_SERVICE}/api/v1/payment/{rental['paymentUid']}")
+                if p_resp.status_code == 200:
+                    payment = p_resp.json()
+            except:
+                payment = {}
+            if rental.get("status") == "CANCELED" and payment != {}:
+                payment = {"paymentUid": rental['paymentUid'], "status": "CANCELED", "price": payment.get("price", 0)}
             return JSONResponse(content={
                 "rentalUid": rental["rentalUid"],
                 "status": rental["status"],
@@ -155,116 +188,155 @@ async def get_rental(rental_uid: str, username: str = Header(..., alias="X-User-
                 },
                 "payment": payment
             })
-    return await rental_cb.call(_call, rental_fallback)
-
-
-class RentalRequest(BaseModel):
-    carUid: str
-    dateFrom: str
-    dateTo: str
-
+    except pybreaker.CircuitBreakerError:
+        return JSONResponse(status_code=503, content={"message": "Rental Service unavailable"})
+    except (ConnectError, TimeoutException, NetworkError):
+        return JSONResponse(status_code=503, content={"message": "Rental Service unavailable"})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"message": str(e)})
 
 @app.post("/api/v1/rental")
-async def create_rental(req: RentalRequest, username: str = Header(..., alias="X-User-Name")):
-    async with httpx.AsyncClient(timeout=3.0) as client:
-        r_cars = await client.get(f"{CARS_SERVICE}/api/v1/cars?showAll=true&page=1&size=1000", timeout=3.0)
-        r_cars.raise_for_status()
-        cars_list = r_cars.json().get("items", [])
-        car = next((c for c in cars_list if c["carUid"] == req.carUid), None)
-        if not car:
-            raise HTTPException(status_code=404, detail="Car not found")
+async def create_rental(
+    req: RentalRequest,
+    request: Request,
+    username: str = Header(..., alias="X-User-Name")
+):
+    request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    if request_id in saga_log and saga_log[request_id].get("status") == "completed":
+        log = saga_log[request_id]
+        async with httpx.AsyncClient() as client:
+            car = await call_get_car(client, log["car_uid"])
+            payment = await client.get(f"{PAYMENT_SERVICE}/api/v1/payment/{log['payment_uid']}").json()
+            return JSONResponse(content={
+                "rentalUid": log["rental_uid"],
+                "carUid": log["car_uid"],
+                "dateFrom": req.dateFrom,
+                "dateTo": req.dateTo,
+                "status": "IN_PROGRESS",
+                "car": {
+                    "carUid": car["carUid"],
+                    "brand": car["brand"],
+                    "model": car["model"],
+                    "registrationNumber": car["registrationNumber"]
+                },
+                "payment": payment
+            })
 
-        date_from = datetime.strptime(req.dateFrom, "%Y-%m-%d")
-        date_to = datetime.strptime(req.dateTo, "%Y-%m-%d")
+    saga_log[request_id] = {"step": "started", "car_uid": req.carUid}
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            car = await call_get_car(client, req.carUid)
+        except pybreaker.CircuitBreakerError:
+            return JSONResponse(status_code=503, content={"message": "Cars Service unavailable"})
+        except (ConnectError, TimeoutException, NetworkError):
+            return JSONResponse(status_code=503, content={"message": "Cars Service unavailable"})
+        except Exception as e:
+            return JSONResponse(status_code=500, content={"message": str(e)})
+
+        try:
+            date_from = datetime.fromisoformat(req.dateFrom)
+            date_to = datetime.fromisoformat(req.dateTo)
+        except ValueError:
+            return JSONResponse(status_code=400, content={"message": "Invalid date format"})
+
         days = (date_to - date_from).days
         if days <= 0:
-            raise HTTPException(status_code=400, detail="Invalid rental period")
+            return JSONResponse(status_code=400, content={"message": "Invalid rental period"})
+
         total_price = car["price"] * days
+        payment_uid = None
+        rental_uid = None
 
-        async def _create_payment():
-            payment = await client.post(f"{PAYMENT_SERVICE}/api/v1/payment", json={"price": total_price}, timeout=3.0)
-            payment.raise_for_status()
-            return payment.json()
+        try:
+            payment_data = await call_create_payment(client, total_price)
+            payment_uid = payment_data["paymentUid"]
+            saga_log[request_id].update({"step": "payment_created", "payment_uid": payment_uid})
 
-        # Вызываем платежный сервис через circuit breaker
-        payment_data = await payment_cb.call(_create_payment, payment_create_fallback)
-        
-        payment_uid = payment_data["paymentUid"]
+            rental_data = await call_create_rental(client, {
+                "carUid": req.carUid,
+                "dateFrom": req.dateFrom,
+                "dateTo": req.dateTo,
+                "paymentUid": payment_uid
+            }, username)
+            rental_uid = rental_data["rentalUid"]
+            saga_log[request_id].update({"step": "rental_created", "rental_uid": rental_uid})
 
-        rental = await client.post(
-            f"{RENTAL_SERVICE}/api/v1/rental",
-            json={"carUid": req.carUid, "dateFrom": req.dateFrom, "dateTo": req.dateTo, "paymentUid": payment_uid},
-            headers={"X-User-Name": username},
-            timeout=3.0
-        )
-        rental.raise_for_status()
-        rental_data = rental.json()
-        rental_uid = rental_data["rentalUid"]
+            await call_reserve_car(client, req.carUid)
+            saga_log[request_id]["status"] = "completed"
 
-        await client.put(f"{CARS_SERVICE}/api/v1/cars/{req.carUid}/reserve", timeout=3.0)
+            return JSONResponse(content={
+                "rentalUid": rental_uid,
+                "carUid": req.carUid,
+                "dateFrom": req.dateFrom,
+                "dateTo": req.dateTo,
+                "status": "IN_PROGRESS",
+                "car": {
+                    "carUid": car["carUid"],
+                    "brand": car["brand"],
+                    "model": car["model"],
+                    "registrationNumber": car["registrationNumber"]
+                },
+                "payment": payment_data
+            })
 
-        return JSONResponse(content={
-            "rentalUid": rental_uid,
-            "carUid": req.carUid,
-            "dateFrom": req.dateFrom,
-            "dateTo": req.dateTo,
-            "status": "IN_PROGRESS",
-            "car": {
-                "carUid": car["carUid"],
-                "brand": car["brand"],
-                "model": car["model"],
-                "registrationNumber": car["registrationNumber"]
-            },
-            "payment": {
-                "paymentUid": payment_data["paymentUid"],
-                "status": payment_data["status"],
-                "price": payment_data["price"]
-            }
-        })
-
+        except pybreaker.CircuitBreakerError:
+            logging.error("Payment service circuit breaker is OPEN")
+            return JSONResponse(status_code=503, content={"message": "Payment Service unavailable"})
+        except (ConnectError, TimeoutException, NetworkError) as e:
+            logging.error(f"Payment service unreachable: {e}")
+            return JSONResponse(status_code=503, content={"message": "Payment Service unavailable"})
+        except Exception as e:
+            logging.error(f"Rental creation failed: {e}")
+            if payment_uid:
+                try:
+                    await call_cancel_payment(client, payment_uid)
+                except Exception:
+                    logging.warning(f"Could not cancel payment {payment_uid}")
+            if rental_uid:
+                try:
+                    await call_cancel_rental(client, rental_uid, username)
+                except Exception:
+                    logging.warning(f"Could not cancel rental {rental_uid}")
+            return JSONResponse(status_code=500, content={"message": "Internal server error"})
 
 @app.post("/api/v1/rental/{rental_uid}/finish")
 async def finish_rental(rental_uid: str, username: str = Header(..., alias="X-User-Name")):
-    async def _call():
+    try:
         async with httpx.AsyncClient() as client:
-            rental = await client.get(f"{RENTAL_SERVICE}/api/v1/rental/{rental_uid}", headers={"X-User-Name": username}, timeout=3.0)
-            rental.raise_for_status()
-            rental_data = rental.json()
-            car_uid = rental_data["carUid"]
-            await client.put(f"{CARS_SERVICE}/api/v1/cars/{car_uid}/release", timeout=3.0)
-            r = await client.post(f"{RENTAL_SERVICE}/api/v1/rental/{rental_uid}/finish", headers={"X-User-Name": username}, timeout=3.0)
-            r.raise_for_status()
-        return Response(status_code=204)
-    return await rental_cb.call(_call, rental_fallback)
-
+            rental = await call_get_rental(client, rental_uid, username)
+            car_uid = rental["carUid"]
+            await call_release_car(client, car_uid)
+            await call_finish_rental(client, rental_uid, username)
+            return Response(status_code=204)
+    except pybreaker.CircuitBreakerError:
+        return JSONResponse(status_code=503, content={"message": "Rental Service unavailable"})
+    except (ConnectError, TimeoutException, NetworkError):
+        return JSONResponse(status_code=503, content={"message": "Rental Service unavailable"})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"message": str(e)})
 
 @app.delete("/api/v1/rental/{rental_uid}")
 async def cancel_rental(rental_uid: str, username: str = Header(..., alias="X-User-Name")):
-    async def _get_rental():
-        async with httpx.AsyncClient() as client:
-            rental = await client.get(f"{RENTAL_SERVICE}/api/v1/rental/{rental_uid}", headers={"X-User-Name": username}, timeout=3.0)
-            rental.raise_for_status()
-            return rental.json()
-    rental_data = await rental_cb.call(_get_rental, rental_fallback)
-    car_uid = rental_data["carUid"]
-    payment_uid = rental_data["paymentUid"]
-
-    async def _release_car():
-        async with httpx.AsyncClient() as client:
-            await client.put(f"{CARS_SERVICE}/api/v1/cars/{car_uid}/release", timeout=3.0)
-    await cars_cb.call(_release_car, cars_fallback)
-
-    async def _cancel_payment():
-        async with httpx.AsyncClient() as client:
-            await client.delete(f"{PAYMENT_SERVICE}/api/v1/payment/{payment_uid}", timeout=3.0)
     try:
-        await payment_cb.call(_cancel_payment, lambda: None)
-    except:
-        pass
-
-    async def _cancel_rental():
         async with httpx.AsyncClient() as client:
-            r = await client.delete(f"{RENTAL_SERVICE}/api/v1/rental/{rental_uid}", headers={"X-User-Name": username}, timeout=3.0)
-            r.raise_for_status()
-        return Response(status_code=204)
-    return await rental_cb.call(_cancel_rental, rental_fallback)
+            rental = await call_get_rental(client, rental_uid, username)
+            car_uid = rental["carUid"]
+            payment_uid = rental["paymentUid"]
+
+            try:
+                await call_cancel_payment(client, payment_uid)
+            except (pybreaker.CircuitBreakerError, ConnectError, TimeoutException, NetworkError):
+                logging.warning(f"Payment service unavailable, cannot cancel {payment_uid}")
+            except Exception as e:
+                logging.warning(f"Failed to cancel payment: {e}")
+
+            await call_release_car(client, car_uid)
+            await call_cancel_rental(client, rental_uid, username)
+            return Response(status_code=204)
+    except pybreaker.CircuitBreakerError:
+        return JSONResponse(status_code=503, content={"message": "Rental Service unavailable"})
+    except (ConnectError, TimeoutException, NetworkError):
+        return JSONResponse(status_code=503, content={"message": "Rental Service unavailable"})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"message": str(e)})
