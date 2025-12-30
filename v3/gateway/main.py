@@ -364,7 +364,7 @@ async def create_rental(
         try:
             car = await call_get_car(client, req.carUid)
         except Exception as e:
-            if TEST_MODE or isinstance(e, (ConnectError, NetworkError)) and "No address associated with hostname" in str(e):
+            if isinstance(e, (ConnectError, NetworkError)) and "No address associated with hostname" in str(e):
                 return JSONResponse(status_code=503, content={"message": "Cars Service unavailable"})
                 
             if redis_client:
