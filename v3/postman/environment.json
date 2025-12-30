@@ -1,7 +1,7 @@
 {
   "_": {
     "postman_variable_scope": "environment",
-    "postman_exported_at": "2025-12-30T09:17:42.200Z",
+    "postman_exported_at": "2025-12-30T09:18:26.764Z",
     "postman_exported_using": "Newman/6.2.1"
   },
   "id": "a7ec827a-303f-4fad-972e-ee60c7b66efe",
@@ -39,11 +39,11 @@
     },
     {
       "type": "any",
-      "value": "b3016d6b-2d7e-4501-8705-ed74ba1568d1",
+      "value": "9ae31c9a-f4ce-4aa3-ab09-32058762da9a",
       "key": "rentalUid"
     }
   ],
   "_postman_variable_scope": "environment",
-  "_postman_exported_at": "2025-12-30T09:17:45.767Z",
+  "_postman_exported_at": "2025-12-30T09:19:01.882Z",
   "_postman_exported_using": "Newman/6.2.1"
 }
