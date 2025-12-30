@@ -459,7 +459,7 @@ async def create_rental(
                     await call_cancel_rental(client, rental_uid, username)
                 except Exception:
                     logging.warning(f"Could not cancel rental {rental_uid}")
-            return JSONResponse(status_code=500, content={"message": "Internal server error"})
+            return JSONResponse(status_code=503, content={"message": "Payment Service unavailable"})
 
 @app.post("/api/v1/rental/{rental_uid}/finish")
 async def finish_rental(rental_uid: str, username: str = Header(..., alias="X-User-Name")):
