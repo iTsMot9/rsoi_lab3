@@ -445,7 +445,8 @@ async def create_rental(
                     "dateTo": req.dateTo
                 }, request_id, username)
                 if result:
-                    return JSONResponse(content=result, status_code=202)
+                    pass
+                    #return JSONResponse(content=result, status_code=202)
             
             logging.error(f"Rental creation failed: {e}")
             if payment_uid:
@@ -508,7 +509,7 @@ async def cancel_rental(rental_uid: str, username: str = Header(..., alias="X-Us
             await call_cancel_rental(client, rental_uid, username)
             return Response(status_code=204)
     except Exception as e:
-        if TEST_MODE or isinstance(e, (ConnectError, NetworkError)) and "No address associated with hostname" in str(e):
+        if isinstance(e, (ConnectError, NetworkError)) and "No address associated with hostname" in str(e):
             return JSONResponse(status_code=500, content={"message": str(e)})
             
         request_id = str(uuid.uuid4())
