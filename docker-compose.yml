@@ -14,34 +14,74 @@ services:
       - ./v3/schema-3.sql:/schemas/schema-3.sql
     ports:
       - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: on-failure
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    command: redis-server --save 60 1 --loglevel warning
 
   gateway:
     build: ./v3/gateway
     ports:
       - "8080:8080"
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - MAX_RETRIES=5
+      - RETRY_DELAY_SECONDS=10
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/manage/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   payment-service:
     build: ./v3/payment-service
     ports:
       - "8050:8050"
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
+    restart: on-failure
 
   rental-service:
     build: ./v3/rental-service
     ports:
       - "8060:8060"
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
+    restart: on-failure
 
   cars-service:
     build: ./v3/cars-service
     ports:
       - "8070:8070"
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
+    restart: on-failure
 
 volumes:
   db-data:
+  redis-data:
